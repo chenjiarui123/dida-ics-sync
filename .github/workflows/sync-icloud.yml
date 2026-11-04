@@ -2,7 +2,7 @@ name: Dida -> iCloud Calendar Sync
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '4,14,24,34,44,54 * * * *'
   workflow_dispatch:
 
 concurrency:
