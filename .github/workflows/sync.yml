@@ -1,0 +1,70 @@
+name: Dida ICS Sync (Gist)
+run-name: Sync Dida Calendar -> Secret Gist
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install icalendar requests
+
+      - name: Fetch current gist content (baseline)
+        run: |
+          URL="https://gist.githubusercontent.com/${{ github.repository_owner }}/${{ secrets.GIST_ID }}/raw/converted.ics"
+          if curl -fsSL "$URL" -o converted.ics; then
+            echo "已获取 Gist 现有内容"
+          else
+            rm -f converted.ics
+            echo "Gist 暂无可读内容，按首次生成处理"
+          fi
+          [ -f converted.ics ] && cp -f converted.ics baseline.ics || true
+
+      - name: Run convert script
+        env:
+          DIDA_ICS_URL: ${{ secrets.DIDA_ICS_URL }}
+        run: python convert.py
+
+      - name: Update gist if changed
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          if [ -f baseline.ics ] && cmp -s converted.ics baseline.ics; then
+            echo "内容无变化，跳过 Gist 更新"
+            exit 0
+          fi
+          python - <<'PY'
+          import json
+          content = open('converted.ics', encoding='utf-8').read()
+          with open('/tmp/payload.json', 'w', encoding='utf-8') as f:
+              json.dump({"files": {"converted.ics": {"content": content}}}, f)
+          PY
+          gh api --method PATCH "/gists/${GIST_ID}" --input /tmp/payload.json > /dev/null
+          echo "已更新 Gist"
+
+      - name: Keep schedule alive (daily heartbeat)
+        run: |
+          d=$(date -u +%F)
+          if [ "$(cat .heartbeat 2>/dev/null)" != "$d" ]; then
+            echo "$d" > .heartbeat
+            git config user.name "actions-bot"
+            git config user.email "actions@github.com"
+            git add .heartbeat
+            git commit -m "heartbeat ${d}" || exit 0
+            git push || true
+          fi

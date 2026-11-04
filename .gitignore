@@ -1,0 +1,6 @@
+converted.ics
+baseline.ics
+__pycache__/
+*.pyc
+.venv*/
+.DS_Store
