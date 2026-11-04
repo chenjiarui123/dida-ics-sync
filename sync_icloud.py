@@ -229,7 +229,8 @@ def do_sync(src_events):
             calendar.save_event(ics)
             created += 1
 
-    # 删除：只删本脚本创建过、且源里已不存在的事件
+    # 删除：源里已经没有、但日历里还留着、且是本脚本创建的事件 → 删掉
+    # （这就是「滴答里删掉 → 手环日历里也跟着删掉」的删除功能）
     src_uids = set(src_events.keys())
     for uid, lst in existing.items():
         if uid in src_uids:
@@ -239,6 +240,7 @@ def do_sync(src_events):
                 try:
                     e_obj.delete()
                     deleted += 1
+                    print(f"[del] 已删除（滴答里已不存在）：{comp.get('SUMMARY')}")
                 except Exception as ex:
                     print(f"[warn] 删除失败 {uid}: {ex}")
 
