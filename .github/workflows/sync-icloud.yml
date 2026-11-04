@@ -31,7 +31,4 @@ jobs:
           ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
           ICLOUD_CALENDAR: ${{ secrets.ICLOUD_CALENDAR }}
           ICLOUD_CALDAV_URL: ${{ secrets.ICLOUD_CALDAV_URL }}
-          FIX_HOUR: "23"
-          FIX_MINUTE: "58"
-          FIX_DURATION_MIN: "1"
         run: python sync_icloud.py

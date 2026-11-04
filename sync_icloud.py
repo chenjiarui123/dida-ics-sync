@@ -2,8 +2,8 @@
 
 设计目标：
 - 把手环能读到的「系统内置日历」事件自动写入 iCloud 专用日历（手环只读系统日历，不读订阅/第三方日历）。
-- 全天事件转成当天 23:58-23:59 的 1 分钟事件：因为手环只显示「未开始」的事件，
-  放在一天最后一分钟可让它在当天整天都算「未开始」而持续显示，不删就一直显示。
+- 保持滴答清单原始写法：全天事件就是真正的全天事件（DTSTART;VALUE=DATE），带时间的事件原样保留；
+  实测手环/iOS 日历能正常显示 CalDAV 写入的全天事件，无需再改成定时事件。
 - 幂等：按 UID upsert；内容无变化不写；只删除带 X-DIDA-SYNC 标记的本脚本创建的事件，绝不碰别的日历事件。
 - 缺 ICLOUD_* 环境变量时安全退出（不报红），方便先部署后配置。
 依赖：caldav + icalendar + requests
@@ -48,7 +48,7 @@ def fetch_ics(url: str) -> bytes:
 
 
 def build_events(raw: bytes):
-    """返回 [(uid, event_component_dict)]，把全天事件转成当天 FIX_HOUR:FIX_MINUTE 的定时事件。"""
+    """返回 {uid: event_component}，保持滴答原始写法（全天即全天，带时间即带时间），仅加同步标记。"""
     cal = Calendar.from_ical(raw)
     result = {}
     for ev in cal.walk("VEVENT"):
@@ -56,32 +56,6 @@ def build_events(raw: bytes):
         if not uid:
             continue
         ev = copy.deepcopy(ev)
-        ds = ev.get("DTSTART")
-        if ds is not None and ds.params.get("VALUE") == "DATE":
-            day = ds.dt
-            start = datetime(day.year, day.month, day.day,
-                             FIX_HOUR, FIX_MINUTE, tzinfo=CN)
-            end = start + timedelta(minutes=FIX_DURATION_MIN)
-            ev["DTSTART"] = vDatetime(start)
-            ev["DTEND"] = vDatetime(end)
-            if "VALUE" in ev["DTSTART"].params:
-                del ev["DTSTART"].params["VALUE"]
-            # 递推事件里若 EXDATE 是纯日期，同步改成定时，避免类型不一致
-            if ev.get("EXDATE") is not None:
-                try:
-                    exd = ev["EXDATE"]
-                    vals = exd.dts if hasattr(exd, "dts") else [exd]
-                    new_vals = []
-                    for dtp in vals:
-                        d = dtp.dt
-                        if isinstance(d, date) and not isinstance(d, datetime):
-                            d = datetime(d.year, d.month, d.day,
-                                         FIX_HOUR, FIX_MINUTE, tzinfo=CN)
-                        new_vals.append(d)
-                    if new_vals:
-                        ev["EXDATE"] = new_vals
-                except Exception as e:
-                    print(f"[warn] EXDATE 处理跳过 {uid}: {e}")
         ev[MARKER] = "1"
         result[str(uid)] = ev
     return result
