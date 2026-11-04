@@ -44,18 +44,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          if [ -f baseline.ics ] && cmp -s converted.ics baseline.ics; then
-            echo "内容无变化，跳过 Gist 更新"
-            exit 0
-          fi
+          # 统一把 baseline 与新内容都规整成 CRLF 再比较，避免 \r\n 与 \n 造成的
+          # 假变更（否则每 10 分钟都会误判为“有变化”而反复 PATCH）。
           python - <<'PY'
-          import json
-          content = open('converted.ics', encoding='utf-8').read()
-          with open('/tmp/payload.json', 'w', encoding='utf-8') as f:
-              json.dump({"files": {"converted.ics": {"content": content}}}, f)
+          import pathlib, json
+          def norm(p):
+              b = pathlib.Path(p).read_bytes()
+              return b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+          new = norm("converted.ics")
+          pathlib.Path("converted.ics").write_bytes(new)
+          base_path = pathlib.Path("baseline.ics")
+          base = norm("baseline.ics") if base_path.exists() else None
+          if base is not None and base == new:
+              print("内容无变化，跳过 Gist 更新")
+              pathlib.Path("/tmp/changed").write_text("0")
+          else:
+              payload = {"files": {"converted.ics": {"content": new.decode("utf-8")}}}
+              pathlib.Path("/tmp/payload.json").write_text(json.dumps(payload), encoding="utf-8")
+              pathlib.Path("/tmp/changed").write_text("1")
+              print("检测到变化，准备更新 Gist")
           PY
-          gh api --method PATCH "/gists/${GIST_ID}" --input /tmp/payload.json > /dev/null
-          echo "已更新 Gist"
+          if [ "$(cat /tmp/changed)" = "1" ]; then
+            gh api --method PATCH "/gists/${GIST_ID}" --input /tmp/payload.json > /dev/null
+            echo "已更新 Gist"
+          fi
 
       - name: Keep schedule alive (daily heartbeat)
         run: |
