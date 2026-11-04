@@ -1,8 +1,7 @@
 name: Dida -> iCloud Calendar Sync
 
 on:
-  schedule:
-    - cron: '4,14,24,34,44,54 * * * *'
+  # 定时触发已交给 Cloudflare Worker（每 10 分钟 dispatch 一次），此处仅保留手动触发
   workflow_dispatch:
 
 concurrency:
