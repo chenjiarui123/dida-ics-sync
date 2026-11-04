@@ -14,6 +14,7 @@
 import os
 import sys
 import copy
+import time
 from datetime import datetime, timedelta, timezone, date
 
 import requests
@@ -41,15 +42,56 @@ CLEAR_FIRST = os.environ.get("CLEAR_FIRST", "0") == "1"
 
 MARKER = "X-DIDA-SYNC"
 
+# 网络抖动（DNS 解析失败、读超时、连接重置）属于临时故障：重试，而不是让整次运行变红。
+# 认证错误（401 / AuthorizationError）不重试——重试也不会好。
+# 单次最坏耗时约 HTTP_TIMEOUT*RETRY_ATTEMPTS + 3 + 8 ≈ 131s，1 分钟一拍的调度会自动排队跟上。
+TRANSIENT_HINTS = (
+    "connectionerror", "readtimeout", "connecttimeout", "timeout", "timed out",
+    "name or service not known", "failed to resolve", "name resolution",
+    "remote disconnected", "connection reset", "connection aborted",
+    "protocolerror", "chunkedencodingerror", "sslerror", "proxyerror",
+    "temporarily unavailable", "eof occurred", "max retries exceeded",
+)
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
+RETRY_DELAYS = (3, 8)
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "40"))
+
+
+def _is_transient(ex: BaseException) -> bool:
+    text = f"{type(ex).__name__} {ex}".lower()
+    if "authorization" in text or "unauthorized" in text or "401" in text \
+            or "bad credentials" in text:
+        return False
+    names = " ".join(t.__name__ for t in type(ex).__mro__).lower()
+    return any(h in names or h in text for h in TRANSIENT_HINTS)
+
+
+def with_retry(fn, what: str):
+    """执行 fn()，遇到临时网络故障时按 RETRY_DELAYS 退避重试。"""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as ex:
+            if attempt >= RETRY_ATTEMPTS or not _is_transient(ex):
+                raise
+            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+            print(f"[retry] {what} 第 {attempt} 次失败：{type(ex).__name__}: {str(ex)[:160]}")
+            print(f"[retry] {delay}s 后重试（{attempt + 1}/{RETRY_ATTEMPTS}）")
+            time.sleep(delay)
+
 
 def fetch_ics(url: str) -> bytes:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+
+    def _get():
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.content
+
+    return with_retry(_get, "拉取滴答 ICS")
 
 
 def _event_day(dtstart):
@@ -160,7 +202,7 @@ def get_or_create_calendar(principal, name):
 
 def do_sync(src_events):
     client = caldav.DAVClient(url=ICLOUD_URL, username=ICLOUD_USERNAME,
-                             password=ICLOUD_APP_PASSWORD)
+                             password=ICLOUD_APP_PASSWORD, timeout=HTTP_TIMEOUT)
     principal = client.principal()
     calendar = get_or_create_calendar(principal, ICLOUD_CALENDAR)
 
@@ -269,7 +311,7 @@ def main():
     if caldav is None:
         print("[error] 未安装 caldav，请 pip install caldav")
         return 1
-    do_sync(src)
+    with_retry(lambda: do_sync(src), "同步到 iCloud")
     return 0
 
 
