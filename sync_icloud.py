@@ -102,7 +102,15 @@ def signature(comp):
         if x is None:
             return ""
         try:
-            return x.dt.isoformat()
+            d = x.dt
+            # 统一归一到「中国墙钟时间」再比较。本地写入是 +08:00 的 aware 时间；
+            # iCloud 读回时把 DTSTART;TZID=UTC+08:00 解析成 naive 本地墙钟，
+            # 同一时刻两种表示不同会造成「每次都被判为变化」，必须归一化。
+            if isinstance(d, datetime):
+                if d.tzinfo is None:
+                    return d.isoformat()
+                return d.astimezone(CN).replace(tzinfo=None).isoformat()
+            return d.isoformat()  # 纯 date 全天
         except Exception:
             return str(x)
 
