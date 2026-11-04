@@ -2,9 +2,12 @@
 
 设计目标：
 - 把手环能读到的「系统内置日历」事件自动写入 iCloud 专用日历（手环只读系统日历，不读订阅/第三方日历）。
-- 保持滴答清单原始写法：全天事件就是真正的全天事件（DTSTART;VALUE=DATE），带时间的事件原样保留；
-  实测手环/iOS 日历能正常显示 CalDAV 写入的全天事件，无需再改成定时事件。
-- 幂等：按 UID upsert；内容无变化不写；只删除带 X-DIDA-SYNC 标记的本脚本创建的事件，绝不碰别的日历事件。
+- 手环只显示「未来 7 天内、尚未开始」的事件：当天的全天事件因被视为「已开始」而不显示，
+  隔天的才显示。因此统一改成事件当天最后一分钟开始的 1 分钟定时事件（默认 23:58→23:59），
+  无论是全天事件还是带时间事件，都落在当天 23:58 —— 这样当天的事件也算「未开始」，手环就会显示。
+- 幂等 + 防重复：每次先读取目标日历；按 UID 分组，同一 UID 若存在多条（历史重复）会清理到只剩 1 条；
+  再按 UID upsert；内容无变化不写；只删除带 X-DIDA-SYNC 标记且源里已不存在的事件，绝不碰别的日历事件。
+  用 CLEAR_FIRST=1 可在每次同步前先清空目标日历（目标日历必须专用）。
 - 缺 ICLOUD_* 环境变量时安全退出（不报红），方便先部署后配置。
 依赖：caldav + icalendar + requests
 """
@@ -28,11 +31,13 @@ ICLOUD_APP_PASSWORD = os.environ.get("ICLOUD_APP_PASSWORD", "")
 ICLOUD_CALENDAR = os.environ.get("ICLOUD_CALENDAR") or "滴答日程"
 ICLOUD_URL = os.environ.get("ICLOUD_CALDAV_URL") or "https://caldav.icloud.com/"
 
-# 全天事件被改成的当天时间（中国无夏令时，用固定 +08:00）
+# 全天/带时间事件统一被改成的当天时间（中国无夏令时，用固定 +08:00）
 CN = timezone(timedelta(hours=8))
 FIX_HOUR = int(os.environ.get("FIX_HOUR", "23"))
 FIX_MINUTE = int(os.environ.get("FIX_MINUTE", "58"))
 FIX_DURATION_MIN = int(os.environ.get("FIX_DURATION_MIN", "1"))
+# 为 1 时，每次同步前先清空目标日历（仅当该日历专用于本脚本时使用）
+CLEAR_FIRST = os.environ.get("CLEAR_FIRST", "0") == "1"
 
 MARKER = "X-DIDA-SYNC"
 
@@ -47,8 +52,24 @@ def fetch_ics(url: str) -> bytes:
     return resp.content
 
 
+def _event_day(dtstart):
+    """返回事件应落在哪一天（date）。全天事件取 date；定时事件按中国墙钟取 date。"""
+    d = dtstart.dt
+    if isinstance(d, datetime):
+        if d.tzinfo is not None:
+            return d.astimezone(CN).date()
+        return d.date()
+    return d  # 已经是 date
+
+
 def build_events(raw: bytes):
-    """返回 {uid: event_component}，保持滴答原始写法（全天即全天，带时间即带时间），仅加同步标记。"""
+    """返回 {uid: event_component}。
+
+    不论原事件是全天(VALUE=DATE)还是带时间，都改成事件当天 FIX_HOUR:FIX_MINUTE 起的
+    FIX_DURATION_MIN 分钟定时事件（默认 23:58→23:59）。原因：小米手环只显示未来 7 天内
+    「尚未开始」的事件，当天全天事件被视为已开始而不显示；放到当天 23:58 这一分钟即可
+    让当天的事件也显示出来。仅额外打同步标记。
+    """
     cal = Calendar.from_ical(raw)
     result = {}
     for ev in cal.walk("VEVENT"):
@@ -56,6 +77,20 @@ def build_events(raw: bytes):
         if not uid:
             continue
         ev = copy.deepcopy(ev)
+        dtstart = ev.get("DTSTART")
+        if dtstart is not None:
+            day = _event_day(dtstart)
+            start_dt = datetime(day.year, day.month, day.day,
+                                FIX_HOUR, FIX_MINUTE, 0, tzinfo=CN)
+            end_dt = start_dt + timedelta(minutes=FIX_DURATION_MIN)
+            ev["DTSTART"] = vDatetime(start_dt)
+            ev["DTEND"] = vDatetime(end_dt)
+            # 清掉旧的 VALUE=DATE 参数（vDatetime 赋值通常已重建属性，这里兜底）
+            for key in ("DTSTART", "DTEND"):
+                p = ev.get(key)
+                params = getattr(p, "params", None)
+                if params and "VALUE" in params:
+                    del params["VALUE"]
         ev[MARKER] = "1"
         result[str(uid)] = ev
     return result
@@ -129,22 +164,61 @@ def do_sync(src_events):
     principal = client.principal()
     calendar = get_or_create_calendar(principal, ICLOUD_CALENDAR)
 
-    # 现有事件： uid -> event_obj
-    existing = {}
+    # 关键：先读取当前日历。防止重复写入的前提。
+    # 同一 UID 可能因历史 bug 存在多条，所以用 uid -> list 收集，后面统一去重。
+    existing = {}   # uid -> list[(event_obj, comp)]
+    total_existing = 0
     for e in calendar.events():
         comp = get_component(e)
         if comp is None:
             continue
+        total_existing += 1
         uid = comp.get("UID")
-        if uid:
-            existing[str(uid)] = (e, comp)
-    print(f"[info] 目标日历「{ICLOUD_CALENDAR}」现有 {len(existing)} 个事件；源有 {len(src_events)} 个")
+        key = str(uid) if uid else f"__no_uid__{id(e)}"
+        existing.setdefault(key, []).append((e, comp))
+    print(f"[info] 目标日历「{ICLOUD_CALENDAR}」现有 {total_existing} 个事件；源有 {len(src_events)} 个")
 
-    created = updated = skipped = deleted = 0
+    deleted = 0
+
+    # 可选：整体清空目标日历后再重建（仅当该日历专用于本脚本时使用）
+    if CLEAR_FIRST:
+        for key, lst in existing.items():
+            for e_obj, _ in lst:
+                try:
+                    e_obj.delete()
+                    deleted += 1
+                except Exception as ex:
+                    print(f"[warn] 清空删除失败 {key}: {ex}")
+        existing = {}
+        print(f"[info] CLEAR_FIRST=1：已清空 {deleted} 个事件，将全量重建")
+
+    # 去重：同一 UID 存在多条（历史重复写入）时保留最合适的一条，其余删除
+    for key, lst in list(existing.items()):
+        if len(lst) <= 1:
+            continue
+        src = src_events.get(key)
+        keep = 0
+        if src is not None:
+            for i, (_e, c) in enumerate(lst):
+                if signature(c) == signature(src):
+                    keep = i
+                    break
+        for i, (e_obj, _c) in enumerate(lst):
+            if i == keep:
+                continue
+            try:
+                e_obj.delete()
+                deleted += 1
+            except Exception as ex:
+                print(f"[warn] 去重删除失败 {key}: {ex}")
+        existing[key] = [lst[keep]]
+
+    created = updated = skipped = 0
     for uid, ev in src_events.items():
         ics = wrap(ev)
-        if uid in existing:
-            e_obj, old_comp = existing[uid]
+        lst = existing.get(uid)
+        if lst:
+            e_obj, old_comp = lst[0]
             if signature(old_comp) == signature(ev):
                 skipped += 1
                 continue
@@ -157,15 +231,16 @@ def do_sync(src_events):
 
     # 删除：只删本脚本创建过、且源里已不存在的事件
     src_uids = set(src_events.keys())
-    for uid, (e_obj, comp) in existing.items():
+    for uid, lst in existing.items():
         if uid in src_uids:
             continue
-        if str(comp.get(MARKER)) == "1":
-            try:
-                e_obj.delete()
-                deleted += 1
-            except Exception as ex:
-                print(f"[warn] 删除失败 {uid}: {ex}")
+        for e_obj, comp in lst:
+            if str(comp.get(MARKER)) == "1":
+                try:
+                    e_obj.delete()
+                    deleted += 1
+                except Exception as ex:
+                    print(f"[warn] 删除失败 {uid}: {ex}")
 
     print(f"[done] 新建 {created}，更新 {updated}，跳过 {skipped}，删除 {deleted}")
 
