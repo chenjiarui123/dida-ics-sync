@@ -1,6 +1,6 @@
 # Dida → iCloud 日历 全自动同步
 
-把滴答清单（Dida365）里的日程，**每 10 分钟自动**同步到 iPhone 的 iCloud「滴答日程」日历，让小米手环（只读系统日历）也能看到滴答的待办/日程。
+把滴答清单（Dida365）里的日程，**每 5 分钟自动**同步到 iPhone 的 iCloud「滴答日程」日历，让小米手环（只读系统日历）也能看到滴答的待办/日程。
 
 > 核心难点：手环只读 **iPhone 系统日历**，**不读订阅日历 / 第三方日历**。所以不能靠「订阅 ICS 链接」，必须把事件真正写进 iCloud 日历。本项目用 **CalDAV** 写入实现。
 
@@ -11,7 +11,7 @@
 ```mermaid
 flowchart TD
     A["滴答清单 App"] -->|"公开订阅链接 (ICS，带 token)"| B["滴答 ICS 订阅源<br/>dida365.com/pub/calendar/feeds/.../basic.ics"]
-    B --> C["Cloudflare Worker 定时<br/>每 10 分钟 dispatch"]
+    B --> C["Cloudflare Worker 定时<br/>每 5 分钟 dispatch"]
     C --> CA["GitHub Actions<br/>workflow_dispatch（手动触发）"]
     CA --> D["sync_icloud.py<br/>拉取 + 解析 ICS"]
     D -->|"统一改写为当天 23:58→23:59 的 1 分钟事件<br/>按 UID 幂等 upsert + 去重"| E["iCloud CalDAV<br/>caldav.icloud.com.cn"]
@@ -29,7 +29,7 @@ sequenceDiagram
     participant S as sync_icloud.py
     participant IC as iCloud CalDAV
 
-    GH->>Dida: 每 10 分钟拉取 ICS
+    GH->>Dida: 每 5 分钟拉取 ICS
     Dida-->>S: 返回全部事件
     S->>S: 解析事件 + 改写为 23:58→23:59 + 打 X-DIDA-SYNC 标记
     S->>IC: 读取「滴答日程」现有事件
@@ -48,7 +48,7 @@ sequenceDiagram
 
 - **统一改成当天最后一分钟的定时事件**：手环只显示「尚未开始」的事件，**当天的全天事件会被当作已开始而不显示**（隔天的才会显示）。所以无论原事件是全天（`VALUE=DATE`）还是带时间，一律改写成**事件当天 23:58→23:59 的 1 分钟定时事件**，这样当天的事件也算「未开始」，手环当天就能看到。可用环境变量 `FIX_HOUR` / `FIX_MINUTE` / `FIX_DURATION_MIN` 调整（默认 23:58、1 分钟）。
 - **先读日历 + 去重，防重复写入**：每次同步**先读取目标日历**；同一 `UID` 若已有**多条**（历史 bug 造成的重复），先清理到只留 1 条，再 upsert。彻底杜绝「越同步越多」的重复事件。
-- **幂等 upsert**：每个事件以滴答的 `UID` 为键。内容（标题/起止/RRULE/描述/地点/状态）没变就**跳过不写**，避免每 10 分钟重复产生请求。
+- **幂等 upsert**：每个事件以滴答的 `UID` 为键。内容（标题/起止/RRULE/描述/地点/状态）没变就**跳过不写**，避免每 5 分钟重复产生请求。
 - **安全删除**：只删除带 `X-DIDA-SYNC=1` 标记、且源里已经不存在的事件；**绝不碰你手动添加的其它日历事件**（除非显式设置 `CLEAR_FIRST=1` 全量重建，此时目标日历必须专用）。
 - **时区归一**：写入是 `+08:00`，iCloud 读回常变成 `TZID=UTC+08:00` 的朴素时间；比较前统一换算成「中国墙钟时间」，否则每次都会被误判为「有变化」。
 - **安全退出**：缺 `ICLOUD_*` 密钥时脚本只打印 `[skip]`、返回 0，不会把 Actions 跑红。
@@ -58,7 +58,7 @@ sequenceDiagram
 ```
 .
 ├── sync_icloud.py                 # 核心同步脚本
-├── .github/workflows/sync-icloud.yml  # 每 10 分钟调度
+├── .github/workflows/sync-icloud.yml  # 每 5 分钟调度（由 Cloudflare Worker dispatch）
 └── .gitignore
 ```
 
@@ -91,13 +91,13 @@ python sync_icloud.py
 - 小米手环官方限制：**只显示未来 7 天内、且尚未开始**的事件。因此本脚本把每个事件都放到它当天 23:58 这一分钟（见「关键设计」），保证当天的事件在当天也算「未开始」而能显示；更远的日程会随日期临近自动出现。
 - 事件在**当天 23:58 之后就变成「已开始/过去」**，会从手环的待办里消失（符合真实时间，属预期行为）。
 - 手环侧需在 **小米运动健康 App → 设备 → 打开「同步事件」** 并授予日历/通知权限。
-- 同步延迟约 1 分钟（Cloudflare Worker 每分钟一次）+ 手机日历同步时间。
+- 同步延迟约 5 分钟（Cloudflare Worker 每 5 分钟一次）+ 手机日历同步时间。
 
 ## 八、常见问题排查
 
 | 现象 | 排查 |
 |---|---|
-| Actions 报 `AuthorizationError / Unauthorized` | 用户名/服务器不对：云上贵州账号用「手机号+86」+ `caldav.icloud.com.cn` |
+| Actions 报 `AuthorizationError / Unauthorized` | 若**持续**出现：用户名/服务器不对——云上贵州账号用「手机号+86」+ `caldav.icloud.com.cn`；若**偶发**：多半是 iCloud 限流/风控（同一密码过几分钟又能好），脚本已会自动冷却重试 |
 | 每次都「更新」不「跳过」 | 时间/时区表示不一致，检查 `signature()` 的时区归一逻辑 |
 | 手环看不到 | 确认事件在 iCloud「滴答日程」里、小米运动健康已开「同步事件」、事件在 7 天内 |
-| Actions 偶发 failure，日志是 `Failed to resolve` / `Read timed out` | 网络抖动：脚本会自动重试 3 次（3s / 8s 退避），仍失败时下一分钟那一拍会补上，无需处理 |
+| Actions 偶发 failure，日志是 `Failed to resolve` / `Read timed out` / `RateLimitError`(429) | 网络抖动或 iCloud 限流：脚本会自动重试 3 次（网络类 3s/8s 退避，限流类按服务端 `Retry-After`，401 类冷却 20s/45s）；整次失败时下一次（5 分钟）那拍会补上，无需处理 |

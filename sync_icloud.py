@@ -12,6 +12,7 @@
 依赖：caldav + icalendar + requests
 """
 import os
+import re
 import sys
 import copy
 import time
@@ -43,39 +44,69 @@ CLEAR_FIRST = os.environ.get("CLEAR_FIRST", "0") == "1"
 MARKER = "X-DIDA-SYNC"
 
 # 网络抖动（DNS 解析失败、读超时、连接重置）属于临时故障：重试，而不是让整次运行变红。
-# 认证错误（401 / AuthorizationError）不重试——重试也不会好。
-# 单次最坏耗时约 HTTP_TIMEOUT*RETRY_ATTEMPTS + 3 + 8 ≈ 131s，1 分钟一拍的调度会自动排队跟上。
+# iCloud 在访问过于频繁时会返回 429 RateLimitError，或临时 401 Unauthorized——同一套密码
+# 过几分钟又能成功，说明并非密码错，而是被 Apple 限流/风控，这类也应重试。真正密码错/服务器
+# 错时重试几次后依旧失败，所以不会掩盖问题。
+# 单次最坏耗时：HTTP_TIMEOUT*RETRY_ATTEMPTS + 退避（3+8 或按服务端 Retry-After）≈ 2~3 分钟，
+# 5 分钟一拍的调度会自然排队跟上。
 TRANSIENT_HINTS = (
     "connectionerror", "readtimeout", "connecttimeout", "timeout", "timed out",
     "name or service not known", "failed to resolve", "name resolution",
     "remote disconnected", "connection reset", "connection aborted",
     "protocolerror", "chunkedencodingerror", "sslerror", "proxyerror",
     "temporarily unavailable", "eof occurred", "max retries exceeded",
+    "ratelimit", "rate limit", "too many requests", "429",
 )
+AUTH_HINTS = ("authorization", "unauthorized", "bad credentials", "401")
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
-RETRY_DELAYS = (3, 8)
+RETRY_DELAYS = (3, 8)          # 网络抖动的退避
+AUTH_RETRY_DELAYS = (20, 45)   # 401 多半是限流/风控，给更长的冷却时间
+RETRY_DELAY_CAP = int(os.environ.get("RETRY_DELAY_CAP", "90"))
+RETRY_ON_AUTH = os.environ.get("RETRY_ON_AUTH", "1") == "1"
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "40"))
+
+_RETRY_AFTER_RE = re.compile(r"retry[- ]after[:\s]+(\d+)", re.I)
+
+
+def _classify(ex: BaseException):
+    """把异常归为 'auth'（401/鉴权）、'transient'（网络抖动/限流）或 None。"""
+    text = f"{type(ex).__name__} {ex}".lower()
+    names = " ".join(t.__name__ for t in type(ex).__mro__).lower()
+    if any(h in names or h in text for h in AUTH_HINTS):
+        return "auth"
+    if any(h in names or h in text for h in TRANSIENT_HINTS):
+        return "transient"
+    return None
 
 
 def _is_transient(ex: BaseException) -> bool:
-    text = f"{type(ex).__name__} {ex}".lower()
-    if "authorization" in text or "unauthorized" in text or "401" in text \
-            or "bad credentials" in text:
-        return False
-    names = " ".join(t.__name__ for t in type(ex).__mro__).lower()
-    return any(h in names or h in text for h in TRANSIENT_HINTS)
+    kind = _classify(ex)
+    if kind == "auth":
+        return RETRY_ON_AUTH
+    return kind == "transient"
+
+
+def _retry_delay(ex: BaseException, attempt: int) -> int:
+    # 优先遵守服务端给出的 Retry-After（如 "Retry after: 60"），但不超过上限
+    m = _RETRY_AFTER_RE.search(str(ex))
+    if m:
+        return min(int(m.group(1)), RETRY_DELAY_CAP)
+    if _classify(ex) == "auth":
+        return AUTH_RETRY_DELAYS[min(attempt - 1, len(AUTH_RETRY_DELAYS) - 1)]
+    return RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
 
 
 def with_retry(fn, what: str):
-    """执行 fn()，遇到临时网络故障时按 RETRY_DELAYS 退避重试。"""
+    """执行 fn()，遇到网络抖动 / 限流(429) / 偶发 401 时退避重试。"""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return fn()
         except Exception as ex:
             if attempt >= RETRY_ATTEMPTS or not _is_transient(ex):
                 raise
-            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
-            print(f"[retry] {what} 第 {attempt} 次失败：{type(ex).__name__}: {str(ex)[:160]}")
+            delay = _retry_delay(ex, attempt)
+            kind = _classify(ex)
+            print(f"[retry] {what} 第 {attempt} 次失败（{kind}）：{type(ex).__name__}: {str(ex)[:160]}")
             print(f"[retry] {delay}s 后重试（{attempt + 1}/{RETRY_ATTEMPTS}）")
             time.sleep(delay)
 
