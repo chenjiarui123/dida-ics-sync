@@ -56,16 +56,35 @@ TRANSIENT_HINTS = (
     "protocolerror", "chunkedencodingerror", "sslerror", "proxyerror",
     "temporarily unavailable", "eof occurred", "max retries exceeded",
     "ratelimit", "rate limit", "too many requests", "429",
+    "403", "forbidden", "bad gateway", "service unavailable",
+    "gateway timeout", "internal server error", "500", "502", "503", "504",
 )
 AUTH_HINTS = ("authorization", "unauthorized", "bad credentials", "401")
+# 这些 HTTP 状态码属于“稍后重试可能成功”，而不是配置/代码错误。
+HTTP_TRANSIENT_STATUS = frozenset((403, 408, 425, 429, 500, 502, 503, 504))
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
 RETRY_DELAYS = (3, 8)          # 网络抖动的退避
 AUTH_RETRY_DELAYS = (20, 45)   # 401 多半是限流/风控，给更长的冷却时间
+RATE_LIMIT_DELAYS = (15, 45)   # 403/429 多半是源站限流/风控，需要更久冷却
 RETRY_DELAY_CAP = int(os.environ.get("RETRY_DELAY_CAP", "90"))
 RETRY_ON_AUTH = os.environ.get("RETRY_ON_AUTH", "1") == "1"
+# 临时故障重试仍失败时，是否把整次 run 标成成功（只留 warning）。
+# 这样偶发限流/网络波动不会每小时发一封失败邮件；真错误（配置、解析、权限等）仍会报红。
+SOFT_FAIL_TRANSIENT = os.environ.get("SOFT_FAIL_TRANSIENT", "1") == "1"
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "40"))
 
 _RETRY_AFTER_RE = re.compile(r"retry[- ]after[:\s]+(\d+)", re.I)
+_STATUS_RE = re.compile(r"\b([45]\d{2})\b")
+
+
+def _status_code(ex: BaseException):
+    """尽量从 requests/caldav 异常里取 HTTP 状态码；取不到返回 None。"""
+    resp = getattr(ex, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int):
+        return code
+    m = _STATUS_RE.search(str(ex))
+    return int(m.group(1)) if m else None
 
 
 def _classify(ex: BaseException):
@@ -74,6 +93,8 @@ def _classify(ex: BaseException):
     names = " ".join(t.__name__ for t in type(ex).__mro__).lower()
     if any(h in names or h in text for h in AUTH_HINTS):
         return "auth"
+    if _status_code(ex) in HTTP_TRANSIENT_STATUS:
+        return "transient"
     if any(h in names or h in text for h in TRANSIENT_HINTS):
         return "transient"
     return None
@@ -87,10 +108,20 @@ def _is_transient(ex: BaseException) -> bool:
 
 
 def _retry_delay(ex: BaseException, attempt: int) -> int:
-    # 优先遵守服务端给出的 Retry-After（如 "Retry after: 60"），但不超过上限
+    # 优先遵守服务端给出的 Retry-After（真实响应头，或 caldav 文本里的 "Retry after: 60"）
+    resp = getattr(ex, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    header_ra = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if header_ra:
+        try:
+            return min(int(str(header_ra).strip()), RETRY_DELAY_CAP)
+        except ValueError:
+            pass
     m = _RETRY_AFTER_RE.search(str(ex))
     if m:
         return min(int(m.group(1)), RETRY_DELAY_CAP)
+    if _status_code(ex) in (403, 429):
+        return RATE_LIMIT_DELAYS[min(attempt - 1, len(RATE_LIMIT_DELAYS) - 1)]
     if _classify(ex) == "auth":
         return AUTH_RETRY_DELAYS[min(attempt - 1, len(AUTH_RETRY_DELAYS) - 1)]
     return RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
@@ -320,7 +351,7 @@ def do_sync(src_events):
     print(f"[done] 新建 {created}，更新 {updated}，跳过 {skipped}，删除 {deleted}")
 
 
-def main():
+def _run():
     if not DIDA_ICS_URL:
         print("[skip] 缺少 DIDA_ICS_URL")
         return 0
@@ -344,6 +375,23 @@ def main():
         return 1
     with_retry(lambda: do_sync(src), "同步到 iCloud")
     return 0
+
+
+def main():
+    try:
+        return _run()
+    except Exception as ex:
+        # 临时故障（网络抖动/限流/偶发 401）在重试后仍失败时，默认不让整次 run 变红。
+        # 否则 Worker 每分钟的调度会在一次限流风暴里发出几十封失败邮件。
+        if SOFT_FAIL_TRANSIENT and _is_transient(ex):
+            kind = _classify(ex) or "unknown"
+            detail = f"{type(ex).__name__}: {str(ex)[:300]}"
+            print(f"[warn] 临时故障（{kind}），重试 {RETRY_ATTEMPTS} 次后仍未恢复：{detail}")
+            print("::warning title=Dida→iCloud 同步临时失败::本轮按成功处理，下一轮调度会自动重试；"
+                  "如持续失败请查看日志或把 SOFT_FAIL_TRANSIENT 设为 0。")
+            return 0
+        print(f"[error] {type(ex).__name__}: {str(ex)[:500]}")
+        raise
 
 
 if __name__ == "__main__":
