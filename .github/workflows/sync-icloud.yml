@@ -29,6 +29,7 @@ jobs:
 
       - name: Restore throttle marker
         id: throttle
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: .sync-slot
