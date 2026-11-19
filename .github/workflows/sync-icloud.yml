@@ -1,15 +1,8 @@
 name: Dida -> iCloud Calendar Sync
 
 on:
-  # 定时触发由 Cloudflare Worker dispatch（它目前仍是每分钟一次）。
-  # 工作流内部用「5 分钟缓存锁」节流：同一个 5 分钟窗口内只有第一次会真正同步，
-  # 其余 dispatch 快速跳过，避免 iCloud/滴答因请求过密触发 429/401/403。
+  # 定时触发由 Cloudflare Worker dispatch（每 5 分钟一次），此处仅保留手动触发
   workflow_dispatch:
-    inputs:
-      force:
-        description: "跳过 5 分钟节流，立即同步一次（手动排查时用）"
-        type: boolean
-        default: false
 
 concurrency:
   group: dida-icloud-sync
@@ -23,38 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Compute 5-minute slot
-        id: slot
-        run: echo "id=$(( $(date +%s) / 300 ))" >> "$GITHUB_OUTPUT"
-
-      - name: Restore throttle marker
-        id: throttle
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: .sync-slot
-          key: dida-sync-slot-${{ steps.slot.outputs.id }}
-
       - name: Checkout
-        if: steps.throttle.outputs.cache-hit != 'true' || inputs.force == true
         uses: actions/checkout@v4
 
-      - name: Mark slot
-        if: steps.throttle.outputs.cache-hit != 'true'
-        run: date -u +%FT%TZ > .sync-slot
-
       - name: Setup Python
-        if: steps.throttle.outputs.cache-hit != 'true' || inputs.force == true
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        if: steps.throttle.outputs.cache-hit != 'true' || inputs.force == true
         run: pip install caldav icalendar requests
 
       - name: Sync to iCloud
-        if: steps.throttle.outputs.cache-hit != 'true' || inputs.force == true
         env:
           DIDA_ICS_URL: ${{ secrets.DIDA_ICS_URL }}
           ICLOUD_USERNAME: ${{ secrets.ICLOUD_USERNAME }}
@@ -68,11 +41,3 @@ jobs:
           # 1=临时故障重试后仍失败时只告警不跑红；0=严格失败（调试时用）
           SOFT_FAIL_TRANSIENT: "1"
         run: python sync_icloud.py
-
-      - name: Save throttle marker
-        if: always() && steps.throttle.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .sync-slot
-          key: dida-sync-slot-${{ steps.slot.outputs.id }}

@@ -1,6 +1,6 @@
 # Dida → iCloud 日历 全自动同步
 
-把滴答清单（Dida365）里的日程，**最快每 5 分钟自动**同步到 iPhone 的 iCloud「滴答日程」日历，让小米手环（只读系统日历）也能看到滴答的待办/日程。Cloudflare Worker 仍按每分钟 dispatch，工作流内部用缓存锁把真正同步限制为每个 5 分钟窗口最多一次，避免过密请求触发限流。
+把滴答清单（Dida365）里的日程，**每 5 分钟自动**同步到 iPhone 的 iCloud「滴答日程」日历，让小米手环（只读系统日历）也能看到滴答的待办/日程。
 
 > 核心难点：手环只读 **iPhone 系统日历**，**不读订阅日历 / 第三方日历**。所以不能靠「订阅 ICS 链接」，必须把事件真正写进 iCloud 日历。本项目用 **CalDAV** 写入实现。
 
@@ -11,8 +11,8 @@
 ```mermaid
 flowchart TD
     A["滴答清单 App"] -->|"公开订阅链接 (ICS，带 token)"| B["滴答 ICS 订阅源<br/>dida365.com/pub/calendar/feeds/.../basic.ics"]
-    B --> C["Cloudflare Worker 定时<br/>每分钟 dispatch"]
-    C --> CA["GitHub Actions<br/>workflow_dispatch + 5 分钟缓存锁"]
+    B --> C["Cloudflare Worker 定时<br/>每 5 分钟 dispatch"]
+    C --> CA["GitHub Actions<br/>workflow_dispatch（手动触发）"]
     CA --> D["sync_icloud.py<br/>拉取 + 解析 ICS"]
     D -->|"统一改写为当天 23:58→23:59 的 1 分钟事件<br/>按 UID 幂等 upsert + 去重"| E["iCloud CalDAV<br/>caldav.icloud.com.cn"]
     E --> F["iCloud 日历：滴答日程"]
@@ -52,14 +52,14 @@ sequenceDiagram
 - **安全删除**：只删除带 `X-DIDA-SYNC=1` 标记、且源里已经不存在的事件；**绝不碰你手动添加的其它日历事件**（除非显式设置 `CLEAR_FIRST=1` 全量重建，此时目标日历必须专用）。
 - **时区归一**：写入是 `+08:00`，iCloud 读回常变成 `TZID=UTC+08:00` 的朴素时间；比较前统一换算成「中国墙钟时间」，否则每次都会被误判为「有变化」。
 - **安全退出**：缺 `ICLOUD_*` 密钥时脚本只打印 `[skip]`、返回 0，不会把 Actions 跑红。
-- **5 分钟节流 + 临时故障不刷红**：Cloudflare Worker 每分钟 dispatch，但工作流用 `.sync-slot` 缓存锁保证同一个 5 分钟窗口只真正同步一次，避免 1440 次/天的 CalDAV 请求触发 Apple 限流。403/429/网络抖动/偶发 401 重试后仍失败时，只输出 `::warning` 并按成功结束（`SOFT_FAIL_TRANSIENT=1`），避免一次限流风暴发出几十封失败邮件；配置、解析、权限等真错误仍会报红。需要严格失败时把 `SOFT_FAIL_TRANSIENT` 设为 `0`。
+- **临时故障不刷红**：403/429/网络抖动/偶发 401 重试后仍失败时，只输出 `::warning` 并按成功结束（`SOFT_FAIL_TRANSIENT=1`），避免一次 iCloud 限流风暴发出几十封失败邮件；配置、解析、权限等真错误仍会报红。需要严格失败时把 `SOFT_FAIL_TRANSIENT` 设为 `0`。
 
 ## 四、目录结构
 
 ```
 .
 ├── sync_icloud.py                 # 核心同步脚本
-├── .github/workflows/sync-icloud.yml  # 每分钟由 Cloudflare Worker dispatch，工作流内节流为 5 分钟一次
+├── .github/workflows/sync-icloud.yml  # 每 5 分钟调度（由 Cloudflare Worker dispatch）
 └── .gitignore
 ```
 
@@ -85,7 +85,7 @@ python sync_icloud.py --dry-run
 python sync_icloud.py
 ```
 
-也可在 Actions 页面点 **Run workflow** 手动触发；默认也受 5 分钟节流，勾选 `force` 可跳过节流立即同步。
+也可在 Actions 页面点 **Run workflow** 手动触发。
 
 ## 七、已知限制
 
